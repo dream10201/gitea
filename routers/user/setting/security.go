@@ -21,6 +21,7 @@ const (
 func Security(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("settings")
 	ctx.Data["PageIsSettingsSecurity"] = true
+	ctx.Data["RequireU2F"] = true
 
 	if ctx.Query("openid.return_to") != "" {
 		settingsOpenIDVerify(ctx)
@@ -34,10 +35,15 @@ func Security(ctx *context.Context) {
 
 // DeleteAccountLink delete a single account link
 func DeleteAccountLink(ctx *context.Context) {
-	if _, err := models.RemoveAccountLink(ctx.User, ctx.QueryInt64("loginSourceID")); err != nil {
-		ctx.Flash.Error("RemoveAccountLink: " + err.Error())
+	id := ctx.QueryInt64("id")
+	if id <= 0 {
+		ctx.Flash.Error("Account link id is not given")
 	} else {
-		ctx.Flash.Success(ctx.Tr("settings.remove_account_link_success"))
+		if _, err := models.RemoveAccountLink(ctx.User, id); err != nil {
+			ctx.Flash.Error("RemoveAccountLink: " + err.Error())
+		} else {
+			ctx.Flash.Success(ctx.Tr("settings.remove_account_link_success"))
+		}
 	}
 
 	ctx.JSON(200, map[string]interface{}{
@@ -63,10 +69,9 @@ func loadSecurityData(ctx *context.Context) {
 			ctx.ServerError("GetU2FRegistrationsByUID", err)
 			return
 		}
-		ctx.Data["RequireU2F"] = true
 	}
 
-	tokens, err := models.ListAccessTokens(ctx.User.ID)
+	tokens, err := models.ListAccessTokens(models.ListAccessTokensOptions{UserID: ctx.User.ID})
 	if err != nil {
 		ctx.ServerError("ListAccessTokens", err)
 		return

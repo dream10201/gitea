@@ -8,15 +8,25 @@ import (
 	"fmt"
 	"time"
 
-	"code.gitea.io/gitea/modules/util"
+	"code.gitea.io/gitea/modules/timeutil"
 )
 
 // Stopwatch represents a stopwatch for time tracking.
 type Stopwatch struct {
-	ID          int64          `xorm:"pk autoincr"`
-	IssueID     int64          `xorm:"INDEX"`
-	UserID      int64          `xorm:"INDEX"`
-	CreatedUnix util.TimeStamp `xorm:"created"`
+	ID          int64              `xorm:"pk autoincr"`
+	IssueID     int64              `xorm:"INDEX"`
+	UserID      int64              `xorm:"INDEX"`
+	CreatedUnix timeutil.TimeStamp `xorm:"created"`
+}
+
+// Seconds returns the amount of time passed since creation, based on local server time
+func (s Stopwatch) Seconds() int64 {
+	return int64(timeutil.TimeStampNow() - s.CreatedUnix)
+}
+
+// Duration returns a human-readable duration string based on local server time
+func (s Stopwatch) Duration() string {
+	return SecToTime(s.Seconds())
 }
 
 func getStopwatch(e Engine, userID, issueID int64) (sw *Stopwatch, exists bool, err error) {
@@ -26,6 +36,21 @@ func getStopwatch(e Engine, userID, issueID int64) (sw *Stopwatch, exists bool, 
 		And("issue_id = ?", issueID).
 		Get(sw)
 	return
+}
+
+// GetUserStopwatches return list of all stopwatches of a user
+func GetUserStopwatches(userID int64, listOptions ListOptions) ([]*Stopwatch, error) {
+	sws := make([]*Stopwatch, 0, 8)
+	sess := x.Where("stopwatch.user_id = ?", userID)
+	if listOptions.Page != 0 {
+		sess = listOptions.setSessionPagination(sess)
+	}
+
+	err := sess.Find(&sws)
+	if err != nil {
+		return nil, err
+	}
+	return sws, nil
 }
 
 // StopwatchExists returns true if the stopwatch exists
@@ -49,6 +74,10 @@ func CreateOrStopIssueStopwatch(user *User, issue *Issue) error {
 	if err != nil {
 		return err
 	}
+	if err := issue.loadRepo(x); err != nil {
+		return err
+	}
+
 	if exists {
 		// Create tracked time out of the time difference between start date and actual date
 		timediff := time.Now().Unix() - int64(sw.CreatedUnix)
@@ -78,6 +107,21 @@ func CreateOrStopIssueStopwatch(user *User, issue *Issue) error {
 			return err
 		}
 	} else {
+		//if another stopwatch is running: stop it
+		exists, sw, err := HasUserStopwatch(user.ID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			issue, err := getIssueByID(x, sw.IssueID)
+			if err != nil {
+				return err
+			}
+			if err := CreateOrStopIssueStopwatch(user, issue); err != nil {
+				return err
+			}
+		}
+
 		// Create stopwatch
 		sw = &Stopwatch{
 			UserID:  user.ID,
@@ -109,6 +153,10 @@ func CancelStopwatch(user *User, issue *Issue) error {
 
 	if exists {
 		if _, err := x.Delete(sw); err != nil {
+			return err
+		}
+
+		if err := issue.loadRepo(x); err != nil {
 			return err
 		}
 

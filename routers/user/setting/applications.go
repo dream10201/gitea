@@ -43,13 +43,25 @@ func ApplicationsPost(ctx *context.Context, form auth.NewAccessTokenForm) {
 		UID:  ctx.User.ID,
 		Name: form.Name,
 	}
+
+	exist, err := models.AccessTokenByNameExists(t)
+	if err != nil {
+		ctx.ServerError("AccessTokenByNameExists", err)
+		return
+	}
+	if exist {
+		ctx.Flash.Error(ctx.Tr("settings.generate_token_name_duplicate", t.Name))
+		ctx.Redirect(setting.AppSubURL + "/user/settings/applications")
+		return
+	}
+
 	if err := models.NewAccessToken(t); err != nil {
 		ctx.ServerError("NewAccessToken", err)
 		return
 	}
 
 	ctx.Flash.Success(ctx.Tr("settings.generate_token_success"))
-	ctx.Flash.Info(t.Sha1)
+	ctx.Flash.Info(t.Token)
 
 	ctx.Redirect(setting.AppSubURL + "/user/settings/applications")
 }
@@ -68,10 +80,23 @@ func DeleteApplication(ctx *context.Context) {
 }
 
 func loadApplicationsData(ctx *context.Context) {
-	tokens, err := models.ListAccessTokens(ctx.User.ID)
+	tokens, err := models.ListAccessTokens(models.ListAccessTokensOptions{UserID: ctx.User.ID})
 	if err != nil {
 		ctx.ServerError("ListAccessTokens", err)
 		return
 	}
 	ctx.Data["Tokens"] = tokens
+	ctx.Data["EnableOAuth2"] = setting.OAuth2.Enable
+	if setting.OAuth2.Enable {
+		ctx.Data["Applications"], err = models.GetOAuth2ApplicationsByUserID(ctx.User.ID)
+		if err != nil {
+			ctx.ServerError("GetOAuth2ApplicationsByUserID", err)
+			return
+		}
+		ctx.Data["Grants"], err = models.GetOAuth2GrantsByUserID(ctx.User.ID)
+		if err != nil {
+			ctx.ServerError("GetOAuth2GrantsByUserID", err)
+			return
+		}
+	}
 }

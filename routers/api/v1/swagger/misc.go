@@ -5,7 +5,7 @@
 package swagger
 
 import (
-	api "code.gitea.io/sdk/gitea"
+	api "code.gitea.io/gitea/modules/structs"
 )
 
 // ServerVersion
@@ -13,4 +13,11 @@ import (
 type swaggerResponseServerVersion struct {
 	// in:body
 	Body api.ServerVersion `json:"body"`
+}
+
+// StringSlice
+// swagger:response StringSlice
+type swaggerResponseStringSlice struct {
+	// in:body
+	Body []string `json:"body"`
 }

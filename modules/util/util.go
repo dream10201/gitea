@@ -5,12 +5,9 @@
 package util
 
 import (
-	"net/url"
-	"path"
+	"bytes"
+	"errors"
 	"strings"
-
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
 )
 
 // OptionalBool a boolean that can be "null"
@@ -56,45 +53,74 @@ func Max(a, b int) int {
 	return a
 }
 
-// URLJoin joins url components, like path.Join, but preserving contents
-func URLJoin(base string, elems ...string) string {
-	if !strings.HasSuffix(base, "/") {
-		base += "/"
-	}
-	baseURL, err := url.Parse(base)
-	if err != nil {
-		log.Error(4, "URLJoin: Invalid base URL %s", base)
-		return ""
-	}
-	joinedPath := path.Join(elems...)
-	argURL, err := url.Parse(joinedPath)
-	if err != nil {
-		log.Error(4, "URLJoin: Invalid arg %s", joinedPath)
-		return ""
-	}
-	joinedURL := baseURL.ResolveReference(argURL).String()
-	if !baseURL.IsAbs() && !strings.HasPrefix(base, "/") {
-		return joinedURL[1:] // Removing leading '/' if needed
-	}
-	return joinedURL
-}
-
-// IsExternalURL checks if rawURL points to an external URL like http://example.com
-func IsExternalURL(rawURL string) bool {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return true
-	}
-	if len(parsed.Host) != 0 && strings.Replace(parsed.Host, "www.", "", 1) != strings.Replace(setting.Domain, "www.", "", 1) {
-		return true
-	}
-	return false
-}
-
 // Min min of two ints
 func Min(a, b int) int {
 	if a > b {
 		return b
 	}
 	return a
+}
+
+// IsEmptyString checks if the provided string is empty
+func IsEmptyString(s string) bool {
+	return len(strings.TrimSpace(s)) == 0
+}
+
+// NormalizeEOL will convert Windows (CRLF) and Mac (CR) EOLs to UNIX (LF)
+func NormalizeEOL(input []byte) []byte {
+	var right, left, pos int
+	if right = bytes.IndexByte(input, '\r'); right == -1 {
+		return input
+	}
+	length := len(input)
+	tmp := make([]byte, length)
+
+	// We know that left < length because otherwise right would be -1 from IndexByte.
+	copy(tmp[pos:pos+right], input[left:left+right])
+	pos += right
+	tmp[pos] = '\n'
+	left += right + 1
+	pos++
+
+	for left < length {
+		if input[left] == '\n' {
+			left++
+		}
+
+		right = bytes.IndexByte(input[left:], '\r')
+		if right == -1 {
+			copy(tmp[pos:], input[left:])
+			pos += length - left
+			break
+		}
+		copy(tmp[pos:pos+right], input[left:left+right])
+		pos += right
+		tmp[pos] = '\n'
+		left += right + 1
+		pos++
+	}
+	return tmp[:pos]
+}
+
+// MergeInto merges pairs of values into a "dict"
+func MergeInto(dict map[string]interface{}, values ...interface{}) (map[string]interface{}, error) {
+	for i := 0; i < len(values); i++ {
+		switch key := values[i].(type) {
+		case string:
+			i++
+			if i == len(values) {
+				return nil, errors.New("specify the key for non array values")
+			}
+			dict[key] = values[i]
+		case map[string]interface{}:
+			m := values[i].(map[string]interface{})
+			for i, v := range m {
+				dict[i] = v
+			}
+		default:
+			return nil, errors.New("dict values must be maps")
+		}
+	}
+
+	return dict, nil
 }

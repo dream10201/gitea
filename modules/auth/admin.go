@@ -5,19 +5,19 @@
 package auth
 
 import (
-	"gopkg.in/macaron.v1"
-
-	"github.com/go-macaron/binding"
+	"gitea.com/macaron/binding"
+	"gitea.com/macaron/macaron"
 )
 
 // AdminCreateUserForm form for admin to create user
 type AdminCreateUserForm struct {
-	LoginType  string `binding:"Required"`
-	LoginName  string
-	UserName   string `binding:"Required;AlphaDashDot;MaxSize(35)"`
-	Email      string `binding:"Required;Email;MaxSize(254)"`
-	Password   string `binding:"MaxSize(255)"`
-	SendNotify bool
+	LoginType          string `binding:"Required"`
+	LoginName          string
+	UserName           string `binding:"Required;AlphaDashDot;MaxSize(40)"`
+	Email              string `binding:"Required;Email;MaxSize(254)"`
+	Password           string `binding:"MaxSize(255)"`
+	SendNotify         bool
+	MustChangePassword bool
 }
 
 // Validate validates form fields
@@ -28,6 +28,7 @@ func (f *AdminCreateUserForm) Validate(ctx *macaron.Context, errs binding.Errors
 // AdminEditUserForm form for admin to create user
 type AdminEditUserForm struct {
 	LoginType               string `binding:"Required"`
+	UserName                string `binding:"AlphaDashDot;MaxSize(40)"`
 	LoginName               string
 	FullName                string `binding:"MaxSize(100)"`
 	Email                   string `binding:"Required;Email;MaxSize(254)"`
@@ -37,13 +38,26 @@ type AdminEditUserForm struct {
 	MaxRepoCreation         int
 	Active                  bool
 	Admin                   bool
+	Restricted              bool
 	AllowGitHook            bool
 	AllowImportLocal        bool
 	AllowCreateOrganization bool
 	ProhibitLogin           bool
+	Reset2FA                bool `form:"reset_2fa"`
 }
 
 // Validate validates form fields
 func (f *AdminEditUserForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
+	return validate(errs, ctx.Data, f, ctx.Locale)
+}
+
+// AdminDashboardForm form for admin dashboard operations
+type AdminDashboardForm struct {
+	Op   string `binding:"required"`
+	From string
+}
+
+// Validate validates form fields
+func (f *AdminDashboardForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
 	return validate(errs, ctx.Data, f, ctx.Locale)
 }

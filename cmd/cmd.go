@@ -9,9 +9,12 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"code.gitea.io/gitea/models"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/modules/util"
+
 	"github.com/urfave/cli"
 )
 
@@ -22,15 +25,42 @@ func argsSet(c *cli.Context, args ...string) error {
 		if !c.IsSet(a) {
 			return errors.New(a + " is not set")
 		}
+
+		if util.IsEmptyString(a) {
+			return errors.New(a + " is required")
+		}
 	}
 	return nil
 }
 
-func initDB() error {
-	setting.NewContext()
-	models.LoadConfigs()
+// confirm waits for user input which confirms an action
+func confirm() (bool, error) {
+	var response string
 
-	setting.NewXORMLogService(false)
+	_, err := fmt.Scanln(&response)
+	if err != nil {
+		return false, err
+	}
+
+	switch strings.ToLower(response) {
+	case "y", "yes":
+		return true, nil
+	case "n", "no":
+		return false, nil
+	default:
+		return false, errors.New(response + " isn't a correct confirmation string")
+	}
+}
+
+func initDB() error {
+	return initDBDisableConsole(false)
+}
+
+func initDBDisableConsole(disableConsole bool) error {
+	setting.NewContext()
+	setting.InitDBConfig()
+
+	setting.NewXORMLogService(disableConsole)
 	if err := models.SetEngine(); err != nil {
 		return fmt.Errorf("models.SetEngine: %v", err)
 	}

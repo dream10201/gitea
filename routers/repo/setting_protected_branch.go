@@ -7,14 +7,16 @@ package repo
 import (
 	"fmt"
 	"strings"
+	"time"
 
-	"code.gitea.io/git"
 	"code.gitea.io/gitea/models"
 	"code.gitea.io/gitea/modules/auth"
 	"code.gitea.io/gitea/modules/base"
 	"code.gitea.io/gitea/modules/context"
+	"code.gitea.io/gitea/modules/git"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
+	pull_service "code.gitea.io/gitea/services/pull"
 )
 
 // ProtectedBranch render the page to protect the repository
@@ -103,7 +105,7 @@ func SettingsProtectedBranch(c *context.Context) {
 
 	protectBranch, err := models.GetProtectedBranchBy(c.Repo.Repository.ID, branch)
 	if err != nil {
-		if !models.IsErrBranchNotExist(err) {
+		if !git.IsErrBranchNotExist(err) {
 			c.ServerError("GetProtectBranchOfRepoByName", err)
 			return
 		}
@@ -116,17 +118,41 @@ func SettingsProtectedBranch(c *context.Context) {
 		}
 	}
 
-	users, err := c.Repo.Repository.GetWriters()
+	users, err := c.Repo.Repository.GetReaders()
 	if err != nil {
-		c.ServerError("Repo.Repository.GetWriters", err)
+		c.ServerError("Repo.Repository.GetReaders", err)
 		return
 	}
 	c.Data["Users"] = users
 	c.Data["whitelist_users"] = strings.Join(base.Int64sToStrings(protectBranch.WhitelistUserIDs), ",")
 	c.Data["merge_whitelist_users"] = strings.Join(base.Int64sToStrings(protectBranch.MergeWhitelistUserIDs), ",")
+	c.Data["approvals_whitelist_users"] = strings.Join(base.Int64sToStrings(protectBranch.ApprovalsWhitelistUserIDs), ",")
+	contexts, _ := models.FindRepoRecentCommitStatusContexts(c.Repo.Repository.ID, 7*24*time.Hour) // Find last week status check contexts
+	for _, context := range protectBranch.StatusCheckContexts {
+		var found bool
+		for _, ctx := range contexts {
+			if ctx == context {
+				found = true
+				break
+			}
+		}
+		if !found {
+			contexts = append(contexts, context)
+		}
+	}
+
+	c.Data["branch_status_check_contexts"] = contexts
+	c.Data["is_context_required"] = func(context string) bool {
+		for _, c := range protectBranch.StatusCheckContexts {
+			if c == context {
+				return true
+			}
+		}
+		return false
+	}
 
 	if c.Repo.Owner.IsOrganization() {
-		teams, err := c.Repo.Owner.TeamsWithAccessToRepo(c.Repo.Repository.ID, models.AccessModeWrite)
+		teams, err := c.Repo.Owner.TeamsWithAccessToRepo(c.Repo.Repository.ID, models.AccessModeRead)
 		if err != nil {
 			c.ServerError("Repo.Owner.TeamsWithAccessToRepo", err)
 			return
@@ -134,6 +160,7 @@ func SettingsProtectedBranch(c *context.Context) {
 		c.Data["Teams"] = teams
 		c.Data["whitelist_teams"] = strings.Join(base.Int64sToStrings(protectBranch.WhitelistTeamIDs), ",")
 		c.Data["merge_whitelist_teams"] = strings.Join(base.Int64sToStrings(protectBranch.MergeWhitelistTeamIDs), ",")
+		c.Data["approvals_whitelist_teams"] = strings.Join(base.Int64sToStrings(protectBranch.ApprovalsWhitelistTeamIDs), ",")
 	}
 
 	c.Data["Branch"] = protectBranch
@@ -150,7 +177,7 @@ func SettingsProtectedBranchPost(ctx *context.Context, f auth.ProtectBranchForm)
 
 	protectBranch, err := models.GetProtectedBranchBy(ctx.Repo.Repository.ID, branch)
 	if err != nil {
-		if !models.IsErrBranchNotExist(err) {
+		if !git.IsErrBranchNotExist(err) {
 			ctx.ServerError("GetProtectBranchOfRepoByName", err)
 			return
 		}
@@ -164,16 +191,81 @@ func SettingsProtectedBranchPost(ctx *context.Context, f auth.ProtectBranchForm)
 				BranchName: branch,
 			}
 		}
+		if f.RequiredApprovals < 0 {
+			ctx.Flash.Error(ctx.Tr("repo.settings.protected_branch_required_approvals_min"))
+			ctx.Redirect(fmt.Sprintf("%s/settings/branches/%s", ctx.Repo.RepoLink, branch))
+		}
 
-		protectBranch.EnableWhitelist = f.EnableWhitelist
-		whitelistUsers, _ := base.StringsToInt64s(strings.Split(f.WhitelistUsers, ","))
-		whitelistTeams, _ := base.StringsToInt64s(strings.Split(f.WhitelistTeams, ","))
+		var whitelistUsers, whitelistTeams, mergeWhitelistUsers, mergeWhitelistTeams, approvalsWhitelistUsers, approvalsWhitelistTeams []int64
+		switch f.EnablePush {
+		case "all":
+			protectBranch.CanPush = true
+			protectBranch.EnableWhitelist = false
+			protectBranch.WhitelistDeployKeys = false
+		case "whitelist":
+			protectBranch.CanPush = true
+			protectBranch.EnableWhitelist = true
+			protectBranch.WhitelistDeployKeys = f.WhitelistDeployKeys
+			if strings.TrimSpace(f.WhitelistUsers) != "" {
+				whitelistUsers, _ = base.StringsToInt64s(strings.Split(f.WhitelistUsers, ","))
+			}
+			if strings.TrimSpace(f.WhitelistTeams) != "" {
+				whitelistTeams, _ = base.StringsToInt64s(strings.Split(f.WhitelistTeams, ","))
+			}
+		default:
+			protectBranch.CanPush = false
+			protectBranch.EnableWhitelist = false
+			protectBranch.WhitelistDeployKeys = false
+		}
+
 		protectBranch.EnableMergeWhitelist = f.EnableMergeWhitelist
-		mergeWhitelistUsers, _ := base.StringsToInt64s(strings.Split(f.MergeWhitelistUsers, ","))
-		mergeWhitelistTeams, _ := base.StringsToInt64s(strings.Split(f.MergeWhitelistTeams, ","))
-		err = models.UpdateProtectBranch(ctx.Repo.Repository, protectBranch, whitelistUsers, whitelistTeams, mergeWhitelistUsers, mergeWhitelistTeams)
+		if f.EnableMergeWhitelist {
+			if strings.TrimSpace(f.MergeWhitelistUsers) != "" {
+				mergeWhitelistUsers, _ = base.StringsToInt64s(strings.Split(f.MergeWhitelistUsers, ","))
+			}
+			if strings.TrimSpace(f.MergeWhitelistTeams) != "" {
+				mergeWhitelistTeams, _ = base.StringsToInt64s(strings.Split(f.MergeWhitelistTeams, ","))
+			}
+		}
+
+		protectBranch.EnableStatusCheck = f.EnableStatusCheck
+		if f.EnableStatusCheck {
+			protectBranch.StatusCheckContexts = f.StatusCheckContexts
+		} else {
+			protectBranch.StatusCheckContexts = nil
+		}
+
+		protectBranch.RequiredApprovals = f.RequiredApprovals
+		protectBranch.EnableApprovalsWhitelist = f.EnableApprovalsWhitelist
+		if f.EnableApprovalsWhitelist {
+			if strings.TrimSpace(f.ApprovalsWhitelistUsers) != "" {
+				approvalsWhitelistUsers, _ = base.StringsToInt64s(strings.Split(f.ApprovalsWhitelistUsers, ","))
+			}
+			if strings.TrimSpace(f.ApprovalsWhitelistTeams) != "" {
+				approvalsWhitelistTeams, _ = base.StringsToInt64s(strings.Split(f.ApprovalsWhitelistTeams, ","))
+			}
+		}
+		protectBranch.BlockOnRejectedReviews = f.BlockOnRejectedReviews
+		protectBranch.BlockOnOfficialReviewRequests = f.BlockOnOfficialReviewRequests
+		protectBranch.DismissStaleApprovals = f.DismissStaleApprovals
+		protectBranch.RequireSignedCommits = f.RequireSignedCommits
+		protectBranch.ProtectedFilePatterns = f.ProtectedFilePatterns
+		protectBranch.BlockOnOutdatedBranch = f.BlockOnOutdatedBranch
+
+		err = models.UpdateProtectBranch(ctx.Repo.Repository, protectBranch, models.WhitelistOptions{
+			UserIDs:          whitelistUsers,
+			TeamIDs:          whitelistTeams,
+			MergeUserIDs:     mergeWhitelistUsers,
+			MergeTeamIDs:     mergeWhitelistTeams,
+			ApprovalsUserIDs: approvalsWhitelistUsers,
+			ApprovalsTeamIDs: approvalsWhitelistTeams,
+		})
 		if err != nil {
 			ctx.ServerError("UpdateProtectBranch", err)
+			return
+		}
+		if err = pull_service.CheckPrsForBaseBranch(ctx.Repo.Repository, protectBranch.BranchName); err != nil {
+			ctx.ServerError("CheckPrsForBaseBranch", err)
 			return
 		}
 		ctx.Flash.Success(ctx.Tr("repo.settings.update_protect_branch_success", branch))

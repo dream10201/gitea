@@ -1,4 +1,5 @@
 // Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2019 The Gitea Authors. All rights reserved.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
@@ -8,20 +9,22 @@ import (
 	"path"
 	"strings"
 
-	"code.gitea.io/git"
 	"code.gitea.io/gitea/models"
 	"code.gitea.io/gitea/modules/base"
+	"code.gitea.io/gitea/modules/charset"
 	"code.gitea.io/gitea/modules/context"
+	"code.gitea.io/gitea/modules/git"
+	"code.gitea.io/gitea/modules/gitgraph"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
-
-	"github.com/Unknwon/paginater"
+	"code.gitea.io/gitea/services/gitdiff"
 )
 
 const (
-	tplCommits base.TplName = "repo/commits"
-	tplGraph   base.TplName = "repo/graph"
-	tplDiff    base.TplName = "repo/diff/page"
+	tplCommits    base.TplName = "repo/commits"
+	tplGraph      base.TplName = "repo/graph"
+	tplGraphDiv   base.TplName = "repo/graph/div"
+	tplCommitPage base.TplName = "repo/commit_page"
 )
 
 // RefCommits render commits page
@@ -55,16 +58,20 @@ func Commits(ctx *context.Context) {
 	if page <= 1 {
 		page = 1
 	}
-	ctx.Data["Page"] = paginater.New(int(commitsCount), git.CommitsRangeSize, page, 5)
+
+	pageSize := ctx.QueryInt("limit")
+	if pageSize <= 0 {
+		pageSize = git.CommitsRangeSize
+	}
 
 	// Both `git log branchName` and `git log commitId` work.
-	commits, err := ctx.Repo.Commit.CommitsByRange(page)
+	commits, err := ctx.Repo.Commit.CommitsByRange(page, pageSize)
 	if err != nil {
 		ctx.ServerError("CommitsByRange", err)
 		return
 	}
 	commits = models.ValidateCommitsWithEmails(commits)
-	commits = models.ParseCommitsWithSignature(commits)
+	commits = models.ParseCommitsWithSignature(commits, ctx.Repo.Repository)
 	commits = models.ParseCommitsWithStatus(commits, ctx.Repo.Repository)
 	ctx.Data["Commits"] = commits
 
@@ -72,13 +79,36 @@ func Commits(ctx *context.Context) {
 	ctx.Data["Reponame"] = ctx.Repo.Repository.Name
 	ctx.Data["CommitCount"] = commitsCount
 	ctx.Data["Branch"] = ctx.Repo.BranchName
+
+	pager := context.NewPagination(int(commitsCount), git.CommitsRangeSize, page, 5)
+	pager.SetDefaultParams(ctx)
+	ctx.Data["Page"] = pager
+
 	ctx.HTML(200, tplCommits)
 }
 
 // Graph render commit graph - show commits from all branches.
 func Graph(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("repo.commit_graph")
 	ctx.Data["PageIsCommits"] = true
 	ctx.Data["PageIsViewCode"] = true
+	mode := strings.ToLower(ctx.QueryTrim("mode"))
+	if mode != "monochrome" {
+		mode = "color"
+	}
+	ctx.Data["Mode"] = mode
+	hidePRRefs := ctx.QueryBool("hide-pr-refs")
+	ctx.Data["HidePRRefs"] = hidePRRefs
+	branches := ctx.QueryStrings("branch")
+	realBranches := make([]string, len(branches))
+	copy(realBranches, branches)
+	for i, branch := range realBranches {
+		if strings.HasPrefix(branch, "--") {
+			realBranches[i] = "refs/heads/" + branch
+		}
+	}
+	ctx.Data["SelectedBranches"] = realBranches
+	files := ctx.QueryStrings("file")
 
 	commitsCount, err := ctx.Repo.GetCommitsCount()
 	if err != nil {
@@ -86,20 +116,61 @@ func Graph(ctx *context.Context) {
 		return
 	}
 
-	graph, err := models.GetCommitGraph(ctx.Repo.GitRepo)
+	graphCommitsCount, err := ctx.Repo.GetCommitGraphsCount(hidePRRefs, realBranches, files)
+	if err != nil {
+		log.Warn("GetCommitGraphsCount error for generate graph exclude prs: %t branches: %s in %-v, Will Ignore branches and try again. Underlying Error: %v", hidePRRefs, branches, ctx.Repo.Repository, err)
+		realBranches = []string{}
+		branches = []string{}
+		graphCommitsCount, err = ctx.Repo.GetCommitGraphsCount(hidePRRefs, realBranches, files)
+		if err != nil {
+			ctx.ServerError("GetCommitGraphsCount", err)
+			return
+		}
+	}
+
+	page := ctx.QueryInt("page")
+
+	graph, err := gitgraph.GetCommitGraph(ctx.Repo.GitRepo, page, 0, hidePRRefs, realBranches, files)
 	if err != nil {
 		ctx.ServerError("GetCommitGraph", err)
 		return
 	}
 
+	if err := graph.LoadAndProcessCommits(ctx.Repo.Repository, ctx.Repo.GitRepo); err != nil {
+		ctx.ServerError("LoadAndProcessCommits", err)
+		return
+	}
+
 	ctx.Data["Graph"] = graph
+
+	gitRefs, err := ctx.Repo.GitRepo.GetRefs()
+	if err != nil {
+		ctx.ServerError("GitRepo.GetRefs", err)
+		return
+	}
+
+	ctx.Data["AllRefs"] = gitRefs
+
 	ctx.Data["Username"] = ctx.Repo.Owner.Name
 	ctx.Data["Reponame"] = ctx.Repo.Repository.Name
 	ctx.Data["CommitCount"] = commitsCount
 	ctx.Data["Branch"] = ctx.Repo.BranchName
-	ctx.Data["RequireGitGraph"] = true
-	ctx.HTML(200, tplGraph)
+	paginator := context.NewPagination(int(graphCommitsCount), setting.UI.GraphMaxCommitNum, page, 5)
+	paginator.AddParam(ctx, "mode", "Mode")
+	paginator.AddParam(ctx, "hide-pr-refs", "HidePRRefs")
+	for _, branch := range branches {
+		paginator.AddParamString("branch", branch)
+	}
+	for _, file := range files {
+		paginator.AddParamString("file", file)
+	}
+	ctx.Data["Page"] = paginator
+	if ctx.QueryBool("div-only") {
+		ctx.HTML(200, tplGraphDiv)
+		return
+	}
 
+	ctx.HTML(200, tplGraph)
 }
 
 // SearchCommits render commits filtered by keyword
@@ -107,24 +178,25 @@ func SearchCommits(ctx *context.Context) {
 	ctx.Data["PageIsCommits"] = true
 	ctx.Data["PageIsViewCode"] = true
 
-	keyword := strings.Trim(ctx.Query("q"), " ")
-	if len(keyword) == 0 {
+	query := strings.Trim(ctx.Query("q"), " ")
+	if len(query) == 0 {
 		ctx.Redirect(ctx.Repo.RepoLink + "/commits/" + ctx.Repo.BranchNameSubURL())
 		return
 	}
-	all := ctx.QueryBool("all")
 
-	commits, err := ctx.Repo.Commit.SearchCommits(keyword, all)
+	all := ctx.QueryBool("all")
+	opts := git.NewSearchCommitsOptions(query, all)
+	commits, err := ctx.Repo.Commit.SearchCommits(opts)
 	if err != nil {
 		ctx.ServerError("SearchCommits", err)
 		return
 	}
 	commits = models.ValidateCommitsWithEmails(commits)
-	commits = models.ParseCommitsWithSignature(commits)
+	commits = models.ParseCommitsWithSignature(commits, ctx.Repo.Repository)
 	commits = models.ParseCommitsWithStatus(commits, ctx.Repo.Repository)
 	ctx.Data["Commits"] = commits
 
-	ctx.Data["Keyword"] = keyword
+	ctx.Data["Keyword"] = query
 	if all {
 		ctx.Data["All"] = "checked"
 	}
@@ -159,7 +231,6 @@ func FileHistory(ctx *context.Context) {
 	if page <= 1 {
 		page = 1
 	}
-	ctx.Data["Page"] = paginater.New(int(commitsCount), git.CommitsRangeSize, page, 5)
 
 	commits, err := ctx.Repo.GitRepo.CommitsByFileAndRange(branchName, fileName, page)
 	if err != nil {
@@ -167,7 +238,7 @@ func FileHistory(ctx *context.Context) {
 		return
 	}
 	commits = models.ValidateCommitsWithEmails(commits)
-	commits = models.ParseCommitsWithSignature(commits)
+	commits = models.ParseCommitsWithSignature(commits, ctx.Repo.Repository)
 	commits = models.ParseCommitsWithStatus(commits, ctx.Repo.Repository)
 	ctx.Data["Commits"] = commits
 
@@ -176,6 +247,11 @@ func FileHistory(ctx *context.Context) {
 	ctx.Data["FileName"] = fileName
 	ctx.Data["CommitCount"] = commitsCount
 	ctx.Data["Branch"] = branchName
+
+	pager := context.NewPagination(int(commitsCount), git.CommitsRangeSize, page, 5)
+	pager.SetDefaultParams(ctx)
+	ctx.Data["Page"] = pager
+
 	ctx.HTML(200, tplCommits)
 }
 
@@ -183,12 +259,31 @@ func FileHistory(ctx *context.Context) {
 func Diff(ctx *context.Context) {
 	ctx.Data["PageIsDiff"] = true
 	ctx.Data["RequireHighlightJS"] = true
+	ctx.Data["RequireSimpleMDE"] = true
+	ctx.Data["RequireTribute"] = true
 
 	userName := ctx.Repo.Owner.Name
 	repoName := ctx.Repo.Repository.Name
 	commitID := ctx.Params(":sha")
+	var (
+		gitRepo  *git.Repository
+		err      error
+		repoPath string
+	)
 
-	commit, err := ctx.Repo.GitRepo.GetCommit(commitID)
+	if ctx.Data["PageIsWiki"] != nil {
+		gitRepo, err = git.OpenRepository(ctx.Repo.Repository.WikiPath())
+		if err != nil {
+			ctx.ServerError("Repo.GitRepo.GetCommit", err)
+			return
+		}
+		repoPath = ctx.Repo.Repository.WikiPath()
+	} else {
+		gitRepo = ctx.Repo.GitRepo
+		repoPath = models.RepoPath(userName, repoName)
+	}
+
+	commit, err := gitRepo.GetCommit(commitID)
 	if err != nil {
 		if git.IsErrNotExist(err) {
 			ctx.NotFound("Repo.GitRepo.GetCommit", err)
@@ -201,14 +296,15 @@ func Diff(ctx *context.Context) {
 		commitID = commit.ID.String()
 	}
 
-	statuses, err := models.GetLatestCommitStatus(ctx.Repo.Repository, ctx.Repo.Commit.ID.String(), 0)
+	statuses, err := models.GetLatestCommitStatus(ctx.Repo.Repository.ID, commitID, models.ListOptions{})
 	if err != nil {
-		log.Error(3, "GetLatestCommitStatus: %v", err)
+		log.Error("GetLatestCommitStatus: %v", err)
 	}
 
 	ctx.Data["CommitStatus"] = models.CalcCommitStatus(statuses)
+	ctx.Data["CommitStatuses"] = statuses
 
-	diff, err := models.GetDiffCommit(models.RepoPath(userName, repoName),
+	diff, err := gitdiff.GetDiffCommit(repoPath,
 		commitID, setting.Git.MaxGitDiffLines,
 		setting.Git.MaxGitDiffLineCharacters, setting.Git.MaxGitDiffFiles)
 	if err != nil {
@@ -219,92 +315,80 @@ func Diff(ctx *context.Context) {
 	parents := make([]string, commit.ParentCount())
 	for i := 0; i < commit.ParentCount(); i++ {
 		sha, err := commit.ParentID(i)
-		parents[i] = sha.String()
 		if err != nil {
 			ctx.NotFound("repo.Diff", err)
 			return
 		}
+		parents[i] = sha.String()
 	}
 
 	ctx.Data["CommitID"] = commitID
+	ctx.Data["AfterCommitID"] = commitID
 	ctx.Data["Username"] = userName
 	ctx.Data["Reponame"] = repoName
-	ctx.Data["IsImageFile"] = commit.IsImageFile
+
+	var parentCommit *git.Commit
+	if commit.ParentCount() > 0 {
+		parentCommit, err = gitRepo.GetCommit(parents[0])
+		if err != nil {
+			ctx.NotFound("GetParentCommit", err)
+			return
+		}
+	}
+	setImageCompareContext(ctx, parentCommit, commit)
+	headTarget := path.Join(userName, repoName)
+	setPathsCompareContext(ctx, parentCommit, commit, headTarget)
 	ctx.Data["Title"] = commit.Summary() + " · " + base.ShortSha(commitID)
 	ctx.Data["Commit"] = commit
-	ctx.Data["Verification"] = models.ParseCommitWithSignature(commit)
+	verification := models.ParseCommitWithSignature(commit)
+	ctx.Data["Verification"] = verification
 	ctx.Data["Author"] = models.ValidateCommitWithEmail(commit)
 	ctx.Data["Diff"] = diff
 	ctx.Data["Parents"] = parents
-	ctx.Data["DiffNotAvailable"] = diff.NumFiles() == 0
-	ctx.Data["SourcePath"] = setting.AppSubURL + "/" + path.Join(userName, repoName, "src", "commit", commitID)
-	if commit.ParentCount() > 0 {
-		ctx.Data["BeforeSourcePath"] = setting.AppSubURL + "/" + path.Join(userName, repoName, "src", "commit", parents[0])
+	ctx.Data["DiffNotAvailable"] = diff.NumFiles == 0
+
+	if err := models.CalculateTrustStatus(verification, ctx.Repo.Repository, nil); err != nil {
+		ctx.ServerError("CalculateTrustStatus", err)
+		return
 	}
-	ctx.Data["RawPath"] = setting.AppSubURL + "/" + path.Join(userName, repoName, "raw", "commit", commitID)
-	ctx.HTML(200, tplDiff)
+
+	note := &git.Note{}
+	err = git.GetNote(ctx.Repo.GitRepo, commitID, note)
+	if err == nil {
+		ctx.Data["Note"] = string(charset.ToUTF8WithFallback(note.Message))
+		ctx.Data["NoteCommit"] = note.Commit
+		ctx.Data["NoteAuthor"] = models.ValidateCommitWithEmail(note.Commit)
+	}
+
+	ctx.Data["BranchName"], err = commit.GetBranchName()
+	if err != nil {
+		ctx.ServerError("commit.GetBranchName", err)
+		return
+	}
+
+	ctx.Data["TagName"], err = commit.GetTagName()
+	if err != nil {
+		ctx.ServerError("commit.GetTagName", err)
+		return
+	}
+	ctx.HTML(200, tplCommitPage)
 }
 
 // RawDiff dumps diff results of repository in given commit ID to io.Writer
 func RawDiff(ctx *context.Context) {
-	if err := models.GetRawDiff(
-		models.RepoPath(ctx.Repo.Owner.Name, ctx.Repo.Repository.Name),
+	var repoPath string
+	if ctx.Data["PageIsWiki"] != nil {
+		repoPath = ctx.Repo.Repository.WikiPath()
+	} else {
+		repoPath = models.RepoPath(ctx.Repo.Owner.Name, ctx.Repo.Repository.Name)
+	}
+	if err := git.GetRawDiff(
+		repoPath,
 		ctx.Params(":sha"),
-		models.RawDiffType(ctx.Params(":ext")),
+		git.RawDiffType(ctx.Params(":ext")),
 		ctx.Resp,
 	); err != nil {
 		ctx.ServerError("GetRawDiff", err)
 		return
 	}
-}
-
-// CompareDiff show different from one commit to another commit
-func CompareDiff(ctx *context.Context) {
-	ctx.Data["IsRepoToolbarCommits"] = true
-	ctx.Data["IsDiffCompare"] = true
-	userName := ctx.Repo.Owner.Name
-	repoName := ctx.Repo.Repository.Name
-	beforeCommitID := ctx.Params(":before")
-	afterCommitID := ctx.Params(":after")
-
-	commit, err := ctx.Repo.GitRepo.GetCommit(afterCommitID)
-	if err != nil {
-		ctx.NotFound("GetCommit", err)
-		return
-	}
-
-	diff, err := models.GetDiffRange(models.RepoPath(userName, repoName), beforeCommitID,
-		afterCommitID, setting.Git.MaxGitDiffLines,
-		setting.Git.MaxGitDiffLineCharacters, setting.Git.MaxGitDiffFiles)
-	if err != nil {
-		ctx.NotFound("GetDiffRange", err)
-		return
-	}
-
-	commits, err := commit.CommitsBeforeUntil(beforeCommitID)
-	if err != nil {
-		ctx.ServerError("CommitsBeforeUntil", err)
-		return
-	}
-	commits = models.ValidateCommitsWithEmails(commits)
-	commits = models.ParseCommitsWithSignature(commits)
-	commits = models.ParseCommitsWithStatus(commits, ctx.Repo.Repository)
-
-	ctx.Data["CommitRepoLink"] = ctx.Repo.RepoLink
-	ctx.Data["Commits"] = commits
-	ctx.Data["CommitCount"] = commits.Len()
-	ctx.Data["BeforeCommitID"] = beforeCommitID
-	ctx.Data["AfterCommitID"] = afterCommitID
-	ctx.Data["Username"] = userName
-	ctx.Data["Reponame"] = repoName
-	ctx.Data["IsImageFile"] = commit.IsImageFile
-	ctx.Data["Title"] = "Comparing " + base.ShortSha(beforeCommitID) + "..." + base.ShortSha(afterCommitID) + " · " + userName + "/" + repoName
-	ctx.Data["Commit"] = commit
-	ctx.Data["Diff"] = diff
-	ctx.Data["DiffNotAvailable"] = diff.NumFiles() == 0
-	ctx.Data["SourcePath"] = setting.AppSubURL + "/" + path.Join(userName, repoName, "src", "commit", afterCommitID)
-	ctx.Data["BeforeSourcePath"] = setting.AppSubURL + "/" + path.Join(userName, repoName, "src", "commit", beforeCommitID)
-	ctx.Data["RawPath"] = setting.AppSubURL + "/" + path.Join(userName, repoName, "raw", "commit", afterCommitID)
-	ctx.Data["RequireHighlightJS"] = true
-	ctx.HTML(200, tplDiff)
 }
